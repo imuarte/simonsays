@@ -52,8 +52,8 @@ public sealed class SimonSaysPlugin : IPlugin
         _deadline = Environment.TickCount64 + seconds * 1000L;
         _warned = false;
         string text = $"Round {_round}: Simon says {task}";
-        _server.Notify(text);
-        _server.Broadcast($"{text} ({seconds} seconds)", TaskColor);
+        _server.Broadcast(text, TaskColor);
+        _server.Notify($"{text} ({seconds} seconds)");
     }
 
     void Tick()
@@ -64,13 +64,13 @@ public sealed class SimonSaysPlugin : IPlugin
             long left = (_deadline - Environment.TickCount64 + 999) / 1000;
             if (left <= 0)
             {
-                _server.Broadcast($"Round {_round} is over", TaskColor);
+                _server.Notify($"Round {_round} is over");
                 Give();
             }
             else if (left <= Warning && !_warned)
             {
                 _warned = true;
-                _server.Broadcast($"{left} seconds left", TaskColor);
+                _server.Notify($"{left} seconds left", brief: true);
             }
         }
     }
