@@ -8,8 +8,9 @@ public sealed class SimonSaysPlugin : IPlugin
     const string TaskColor = "yellow";
     const string EndColor = "red";
     const int Countdown = 10;
+    const long Pause = 10_000;
 
-    static readonly (string Task, int Seconds)[] Tasks = [("/wave", 30)];
+    static readonly (string Task, int Seconds)[] Tasks = [("/wave", 30), ("jump", 15)];
     static readonly int[] Marks = [.. Enumerable.Range(1, Countdown).Reverse().Select(second => second * 1000), 750, 500, 250];
 
     readonly object _sync = new();
@@ -17,6 +18,7 @@ public sealed class SimonSaysPlugin : IPlugin
     int _round;
     int _next = -1;
     long _deadline;
+    long _pauseUntil;
     int _mark;
 
     public void Load(IServer server)
@@ -36,6 +38,7 @@ public sealed class SimonSaysPlugin : IPlugin
                 return;
             }
             _next = 0;
+            _pauseUntil = 0;
             Give();
         }
     }
@@ -64,11 +67,21 @@ public sealed class SimonSaysPlugin : IPlugin
         lock (_sync)
         {
             if (_next < 0) return;
-            long left = _deadline - Environment.TickCount64;
+            long now = Environment.TickCount64;
+            if (_pauseUntil > 0)
+            {
+                if (now < _pauseUntil) return;
+                _pauseUntil = 0;
+                Give();
+                return;
+            }
+
+            long left = _deadline - now;
             if (left <= 0)
             {
                 _server.Notify($"Round {_round} is over");
-                Give();
+                if (_next < Tasks.Length) _pauseUntil = now + Pause;
+                else Give();
                 return;
             }
             if (_mark == Marks.Length || left > Marks[_mark]) return;
