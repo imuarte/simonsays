@@ -10,13 +10,15 @@ public sealed class SimonSaysPlugin : IPlugin
     const int Countdown = 10;
     const long Pause = 10_000;
 
-    static readonly (string Task, int Seconds)[] Tasks = [("/wave", 30), ("jump", 15)];
+    static readonly (string Task, int Seconds, string? Gesture)[] Tasks = [("/wave", 30, "wave"), ("jump", 15, null)];
     static readonly int[] Marks = [.. Enumerable.Range(1, Countdown).Reverse().Select(second => second * 1000), 750, 500, 250];
 
     readonly object _sync = new();
+    readonly HashSet<IPlayer> _done = [];
     IServer _server = null!;
     int _round;
     int _next = -1;
+    string? _gesture;
     long _deadline;
     long _pauseUntil;
     int _mark;
@@ -26,6 +28,7 @@ public sealed class SimonSaysPlugin : IPlugin
         _server = server;
         server.AddCommand("simonsays", Start);
         server.Update += Update;
+        server.Gesture += Gesture;
     }
 
     void Start(IPlayer player, string[] arguments)
@@ -52,14 +55,34 @@ public sealed class SimonSaysPlugin : IPlugin
             return;
         }
 
-        (string task, int seconds) = Tasks[_next++];
+        (string task, int seconds, _gesture) = Tasks[_next++];
         _round++;
         _deadline = Environment.TickCount64 + seconds * 1000L;
         _mark = 0;
+        _done.Clear();
         string text = $"Round {_round}: Simon says {task}";
         _server.Broadcast(text, TaskColor);
         _server.Notify(text);
         _server.Notify($"{seconds} seconds", brief: true);
+    }
+
+    void Gesture(IPlayer player, string name)
+    {
+        lock (_sync)
+        {
+            if (_next < 0 || _pauseUntil > 0 || name != _gesture || !_done.Add(player)) return;
+            player.Notify("Done!", brief: true);
+        }
+    }
+
+    void Summary()
+    {
+        if (_gesture is null) return;
+        IReadOnlyList<IPlayer> everyone = _server.Players;
+        string did = string.Join(", ", everyone.Where(_done.Contains).Select(player => player.Name));
+        string missed = string.Join(", ", everyone.Where(player => !_done.Contains(player)).Select(player => player.Name));
+        _server.Broadcast(did.Length > 0 ? $"Did it: {did}" : "Nobody did it", TaskColor);
+        if (missed.Length > 0) _server.Broadcast($"Missed: {missed}", TaskColor);
     }
 
     void Update(float elapsed)
@@ -80,6 +103,7 @@ public sealed class SimonSaysPlugin : IPlugin
             if (left <= 0)
             {
                 _server.Notify($"Round {_round} is over");
+                Summary();
                 if (_next < Tasks.Length) _pauseUntil = now + Pause;
                 else Give();
                 return;
