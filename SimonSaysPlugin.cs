@@ -55,7 +55,8 @@ public sealed class SimonSaysPlugin : IPlugin
         _mark = 0;
         string text = $"Round {_round}: Simon says {task}";
         _server.Broadcast(text, TaskColor);
-        _server.Notify($"{text} ({seconds} seconds)");
+        _server.Notify(text);
+        _server.Notify($"{seconds} seconds", brief: true);
     }
 
     void Update(float elapsed)
