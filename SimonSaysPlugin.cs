@@ -10,7 +10,7 @@ public sealed class SimonSaysPlugin : IPlugin
     const int Countdown = 10;
     const long Pause = 10_000;
 
-    static readonly (string Task, int Seconds, string? Gesture, string? Animation)[] Tasks = [("/wave", 30, "wave", null), ("jump", 15, null, "jump")];
+    static readonly (string Task, int Seconds, Gesture? Gesture, AvatarAnimation? Animation)[] Tasks = [("/wave", 30, Gesture.Wave, null), ("jump", 15, null, AvatarAnimation.Jump)];
     static readonly int[] Marks = [.. Enumerable.Range(1, Countdown).Reverse().Select(second => second * 1000), 750, 500, 250];
 
     readonly object _sync = new();
@@ -18,8 +18,8 @@ public sealed class SimonSaysPlugin : IPlugin
     IServer _server = null!;
     int _round;
     int _next = -1;
-    string? _gesture;
-    string? _animation;
+    Gesture? _gesture;
+    AvatarAnimation? _animation;
     long _deadline;
     long _pauseUntil;
     int _mark;
@@ -29,8 +29,8 @@ public sealed class SimonSaysPlugin : IPlugin
         _server = server;
         server.AddCommand("simonsays", Start);
         server.Update += Update;
-        server.Gesture += Gesture;
-        server.Animation += Animation;
+        server.PlayerGestured += Gestured;
+        server.PlayerAnimated += Animated;
     }
 
     void Start(IPlayer player, string[] arguments)
@@ -68,16 +68,16 @@ public sealed class SimonSaysPlugin : IPlugin
         _server.Notify($"{seconds} seconds", brief: true);
     }
 
-    void Gesture(IPlayer player, string name)
+    void Gestured(IPlayer player, Gesture gesture)
     {
         lock (_sync)
-            if (name == _gesture) Done(player);
+            if (gesture == _gesture) Done(player);
     }
 
-    void Animation(IPlayer player, string state)
+    void Animated(IPlayer player, AvatarAnimation animation)
     {
         lock (_sync)
-            if (_animation is not null && state.Contains(_animation, StringComparison.OrdinalIgnoreCase)) Done(player);
+            if (animation == _animation) Done(player);
     }
 
     void Done(IPlayer player)
