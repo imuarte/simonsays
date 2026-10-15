@@ -6,11 +6,20 @@ namespace SimonSays;
 public sealed class SimonSaysPlugin : IPlugin
 {
     const string TaskColor = "yellow";
+    const string DoneColor = "green";
     const string EndColor = "red";
     const int Countdown = 10;
     const long Pause = 10_000;
 
-    static readonly (string Task, int Seconds, Gesture? Gesture, AvatarAnimation? Animation)[] Tasks = [("/wave", 30, Gesture.Wave, null), ("jump", 15, null, AvatarAnimation.Jump)];
+    enum Goal { Wave, Jump, DropWeapon, PickUp }
+
+    static readonly (string Task, int Seconds, Goal Goal)[] Tasks =
+    [
+        ("/wave", 30, Goal.Wave),
+        ("jump", 15, Goal.Jump),
+        ("drop your weapon", 10, Goal.DropWeapon),
+        ("pick up a weapon", 10, Goal.PickUp),
+    ];
     static readonly int[] Marks = [.. Enumerable.Range(1, Countdown).Reverse().Select(second => second * 1000), 750, 500, 250];
 
     readonly object _sync = new();
@@ -18,8 +27,7 @@ public sealed class SimonSaysPlugin : IPlugin
     IServer _server = null!;
     int _round;
     int _next = -1;
-    Gesture? _gesture;
-    AvatarAnimation? _animation;
+    Goal _goal;
     long _deadline;
     long _pauseUntil;
     int _mark;
@@ -29,9 +37,13 @@ public sealed class SimonSaysPlugin : IPlugin
         _server = server;
         server.AddCommand("simonsays", Start);
         server.Update += Update;
-        server.PlayerGestured += Gestured;
-        server.PlayerAnimated += Animated;
+        server.PlayerGestured += (player, gesture) => Check(player, Goal.Wave, gesture == Gesture.Wave);
+        server.PlayerAnimated += (player, animation) => Check(player, Goal.Jump, animation == AvatarAnimation.Jump);
+        server.PlayerSwitchedItem += (player, item) => Check(player, Goal.DropWeapon, EmptyHanded(item));
+        server.PlayerPickedUp += (player, _) => Check(player, Goal.PickUp, true);
     }
+
+    static bool EmptyHanded(AvatarItem item) => item is AvatarItem.Hand or AvatarItem.LaserPointer;
 
     void Start(IPlayer player, string[] arguments)
     {
@@ -57,7 +69,7 @@ public sealed class SimonSaysPlugin : IPlugin
             return;
         }
 
-        (string task, int seconds, _gesture, _animation) = Tasks[_next++];
+        (string task, int seconds, _goal) = Tasks[_next++];
         _round++;
         _deadline = Environment.TickCount64 + seconds * 1000L;
         _mark = 0;
@@ -66,29 +78,27 @@ public sealed class SimonSaysPlugin : IPlugin
         _server.Broadcast(text, TaskColor);
         _server.Notify(text);
         _server.Notify($"{seconds} seconds", brief: true);
+
+        if (_goal == Goal.DropWeapon)
+            foreach (IPlayer player in _server.Players.Where(player => EmptyHanded(player.Holding)))
+                Done(player);
     }
 
-    void Gestured(IPlayer player, Gesture gesture)
+    void Check(IPlayer player, Goal goal, bool met)
     {
         lock (_sync)
-            if (gesture == _gesture) Done(player);
-    }
-
-    void Animated(IPlayer player, AvatarAnimation animation)
-    {
-        lock (_sync)
-            if (animation == _animation) Done(player);
+            if (met && goal == _goal) Done(player);
     }
 
     void Done(IPlayer player)
     {
         if (_next < 0 || _pauseUntil > 0 || !_done.Add(player)) return;
         player.Notify("Done!", brief: true);
+        _server.Broadcast($"{player.Name} done", DoneColor);
     }
 
     void Summary()
     {
-        if (_gesture is null && _animation is null) return;
         IReadOnlyList<IPlayer> everyone = _server.Players;
         string did = string.Join(", ", everyone.Where(_done.Contains).Select(player => player.Name));
         string missed = string.Join(", ", everyone.Where(player => !_done.Contains(player)).Select(player => player.Name));
