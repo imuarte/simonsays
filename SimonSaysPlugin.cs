@@ -6,7 +6,7 @@ namespace SimonSays;
 public sealed class SimonSaysPlugin : IPlugin
 {
     const string TaskColor = "yellow";
-    const string DoneColor = "green";
+    const string DoneColor = "lime";
     const string EndColor = "red";
     const int Countdown = 10;
     const long Pause = 10_000;
