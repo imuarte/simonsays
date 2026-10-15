@@ -10,7 +10,7 @@ public sealed class SimonSaysPlugin : IPlugin
     const int Countdown = 10;
     const long Pause = 10_000;
 
-    static readonly (string Task, int Seconds, string? Gesture)[] Tasks = [("/wave", 30, "wave"), ("jump", 15, null)];
+    static readonly (string Task, int Seconds, string? Gesture, string? Animation)[] Tasks = [("/wave", 30, "wave", null), ("jump", 15, null, "jump")];
     static readonly int[] Marks = [.. Enumerable.Range(1, Countdown).Reverse().Select(second => second * 1000), 750, 500, 250];
 
     readonly object _sync = new();
@@ -19,6 +19,7 @@ public sealed class SimonSaysPlugin : IPlugin
     int _round;
     int _next = -1;
     string? _gesture;
+    string? _animation;
     long _deadline;
     long _pauseUntil;
     int _mark;
@@ -29,6 +30,7 @@ public sealed class SimonSaysPlugin : IPlugin
         server.AddCommand("simonsays", Start);
         server.Update += Update;
         server.Gesture += Gesture;
+        server.Animation += Animation;
     }
 
     void Start(IPlayer player, string[] arguments)
@@ -55,7 +57,7 @@ public sealed class SimonSaysPlugin : IPlugin
             return;
         }
 
-        (string task, int seconds, _gesture) = Tasks[_next++];
+        (string task, int seconds, _gesture, _animation) = Tasks[_next++];
         _round++;
         _deadline = Environment.TickCount64 + seconds * 1000L;
         _mark = 0;
@@ -69,15 +71,24 @@ public sealed class SimonSaysPlugin : IPlugin
     void Gesture(IPlayer player, string name)
     {
         lock (_sync)
-        {
-            if (_next < 0 || _pauseUntil > 0 || name != _gesture || !_done.Add(player)) return;
-            player.Notify("Done!", brief: true);
-        }
+            if (name == _gesture) Done(player);
+    }
+
+    void Animation(IPlayer player, string state)
+    {
+        lock (_sync)
+            if (_animation is not null && state.Contains(_animation, StringComparison.OrdinalIgnoreCase)) Done(player);
+    }
+
+    void Done(IPlayer player)
+    {
+        if (_next < 0 || _pauseUntil > 0 || !_done.Add(player)) return;
+        player.Notify("Done!", brief: true);
     }
 
     void Summary()
     {
-        if (_gesture is null) return;
+        if (_gesture is null && _animation is null) return;
         IReadOnlyList<IPlayer> everyone = _server.Players;
         string did = string.Join(", ", everyone.Where(_done.Contains).Select(player => player.Name));
         string missed = string.Join(", ", everyone.Where(player => !_done.Contains(player)).Select(player => player.Name));
