@@ -12,6 +12,26 @@ public sealed class SimonSaysPlugin : IPlugin
     const long Rest = 5_000;
     const long Calm = 5_000;
     const long Rise = 7_500;
+    const long FreezeDelay = 6_000;
+    const long Freeze = 7_000;
+    const float MoveTolerance = 1f;
+    const long BoostEvery = 6_000;
+    const int TntWaves = 3;
+    const long TntGap = 7_000;
+    const long TntWire = 1_000;
+    const long TntFuse = 4_000;
+    const long TntSettle = 2_500;
+    const float TntSpread = 3f;
+    const float TntDepth = 200f;
+    const long DrainDelay = 5_000;
+    const long DrainTime = 10_000;
+    const long DrainEvery = 200;
+    const float DrainTotal = 110f;
+    const float MedkitSpread = 8f;
+    const string SniperMarker = "sniper";
+    const string LandMarker = "land";
+    const long LandHold = 1_500;
+    const long PortalGrace = 6_000;
     const float RiseHeight = 12f;
     const float EbbSeconds = 2f;
     const long ClientDelay = 600;
@@ -40,7 +60,9 @@ public sealed class SimonSaysPlugin : IPlugin
     const string MinKey = "min";
     const string StateKey = "state";
     const string PlateKey = "plate";
+    const string NightKey = "night";
     const long StateSettle = 3_000;
+    const long SkyGap = 1_000;
     const string Usage = "Use !simonsays to join, or !simonsays start, stop or config";
     const int Light = 0xFFF1D6;
     const int Sand = 0xD9B98C;
@@ -53,7 +75,7 @@ public sealed class SimonSaysPlugin : IPlugin
     static readonly int[] Heat = [0xFF7A45, 0xFFA04D, 0xFFC15E, 0xFFE08A];
     static readonly string Title = Bold(Tint("Simon Says", Gold));
 
-    enum Goal { Wave, Jump, DropWeapon, PickUp, Water, Colossus }
+    enum Goal { Wave, Jump, DropWeapon, PickUp, Water, Underwater, Freeze, Seek, Tnt, Colossus, Drain, Leap }
 
     static readonly (string Task, double Seconds, Goal Goal)[] Tasks =
     [
@@ -62,7 +84,13 @@ public sealed class SimonSaysPlugin : IPlugin
         ("drop your weapon", 10, Goal.DropWeapon),
         ("pick up a weapon", 10, Goal.PickUp),
         ("don't touch the water", (Calm + Rise) / 1000.0, Goal.Water),
+        ("go underwater", 30, Goal.Underwater),
+        ("don't move", (FreezeDelay + Freeze) / 1000.0, Goal.Freeze),
+        ("hide", 20, Goal.Seek),
+        ("survive the TNT", (TntGap * (TntWaves - 1) + TntFuse + TntSettle) / 1000.0, Goal.Tnt),
         ("kill the Colossus", 0, Goal.Colossus),
+        ("pick up health packs", (DrainDelay + DrainTime + 1_000) / 1000.0, Goal.Drain),
+        ("jump onto the bounce pad", 20, Goal.Leap),
     ];
     static readonly int[] Marks = [5000, 3000, 2000, 1000];
 
@@ -96,6 +124,8 @@ public sealed class SimonSaysPlugin : IPlugin
     readonly HashSet<IPlayer> _contestants = [];
     readonly List<Giant> _giants = [];
     readonly List<(INpc Npc, long RemoveAt)> _fallen = [];
+    readonly Dictionary<IPlayer, Vector3> _spots = [];
+    readonly Dictionary<IPlayer, (bool Night, long At)> _skies = [];
     IServer _server = null!;
     IPluginStorage _store = null!;
     IWorld _world = null!;
@@ -104,6 +134,7 @@ public sealed class SimonSaysPlugin : IPlugin
     int? _min;
     int? _stateBox;
     int? _statePlate;
+    int? _nightPlate;
     long _settleUntil;
     bool _seen;
     int _announced = -1;
@@ -121,6 +152,23 @@ public sealed class SimonSaysPlugin : IPlugin
     Vector3 _waterHome;
     long _riseAt;
     bool _rising;
+    long _freezeAt;
+    IPlayer? _seeker;
+    readonly List<int> _tnts = [];
+    int _tntPlate = -1;
+    int _wavesLeft;
+    long _nextWave;
+    long _wireAt;
+    long _blastAt;
+    long _blastEnd;
+    readonly List<int> _medkits = [];
+    long _drainFrom;
+    long _nextDrain;
+    long _drainUntil;
+    readonly HashSet<IPlayer> _aloft = [];
+    readonly Dictionary<IPlayer, long> _landed = [];
+    long _graceUntil;
+    long _nextBoost;
 
     public void Load(IServer server)
     {
@@ -130,14 +178,17 @@ public sealed class SimonSaysPlugin : IPlugin
         _min = Stored(MinKey);
         _stateBox = Stored(StateKey);
         _statePlate = Stored(PlateKey);
+        _nightPlate = Stored(NightKey);
         server.AddCommand("simonsays", Command);
         server.Update += Update;
         server.PlayerJoined += Joined;
+        server.PlayerLeft += Left;
         server.PlayerGestured += (player, gesture) => Check(player, Goal.Wave, gesture == Gesture.Wave);
         server.PlayerAnimated += (player, animation) => Check(player, Goal.Jump, animation == AvatarAnimation.Jump);
         server.PlayerSwitchedItem += (player, item) => Check(player, Goal.DropWeapon, EmptyHanded(item));
         server.PlayerPickedUp += (player, _) => Check(player, Goal.PickUp, true);
         server.PlayerKilledByNpc += KilledByNpc;
+        server.PlayerHit += Hit;
     }
 
     public void Unload()
@@ -146,6 +197,9 @@ public sealed class SimonSaysPlugin : IPlugin
         {
             if (_next >= 0)
             {
+                Unseek();
+                ClearTnt();
+                ClearMedkits();
                 foreach (IPlayer player in Remaining().ToList()) ToLobby(player);
                 SetState(_world, false);
             }
@@ -155,7 +209,35 @@ public sealed class SimonSaysPlugin : IPlugin
             _giants.Clear();
             _fallen.Clear();
             _next = -1;
+            ClearSkies();
         }
+    }
+
+    void Left(IPlayer player)
+    {
+        lock (_sync) _skies.Remove(player);
+    }
+
+    void Skies(long now)
+    {
+        if (_autoWorld is not int id || _nightPlate is not int plate) return;
+        foreach (IWorld world in _server.Worlds.Where(open => open.Id == id))
+            foreach (IPlayer player in world.Players)
+            {
+                if (player.Position is null) continue;
+                bool night = Dark;
+                (bool shown, long at) = _skies.GetValueOrDefault(player);
+                if (shown == night || now - at < SkyGap) continue;
+                if (player.PressLocally(plate)) _skies[player] = (night, now);
+            }
+    }
+
+    void ClearSkies()
+    {
+        if (_nightPlate is int plate)
+            foreach ((IPlayer player, (bool night, _)) in _skies)
+                if (night) player.PressLocally(plate);
+        _skies.Clear();
     }
 
     static bool EmptyHanded(AvatarItem item) => item is AvatarItem.Hand or AvatarItem.LaserPointer;
@@ -283,8 +365,26 @@ public sealed class SimonSaysPlugin : IPlugin
                 Save(PlateKey, plate);
                 player.Message($"Plate {plate} switches the round state");
                 break;
+            case "night" when value == "off":
+                ClearSkies();
+                _nightPlate = null;
+                Save(NightKey, null);
+                player.Message("Night off");
+                break;
+            case "night" when int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out int night):
+                if (world.Find(night)?.Type is not ("PressurePlate" or "TriggerCube" or "TriggerBox"))
+                {
+                    player.Message($"{night} isn't a Pressure Plate in this world");
+                    break;
+                }
+                Claim(world);
+                ClearSkies();
+                _nightPlate = night;
+                Save(NightKey, night);
+                player.Message($"Plate {night} switches night, on for the red team and off for the blue team");
+                break;
             default:
-                player.Message("Use config, config min <players>, config state <id>, config plate <id>, or off after any of them");
+                player.Message("Use config, config min <players>, config state <id>, config plate <id>, config night <id>, or off after any of them");
                 break;
         }
     }
@@ -292,15 +392,18 @@ public sealed class SimonSaysPlugin : IPlugin
     void Claim(IWorld world)
     {
         if (_autoWorld == world.Id) return;
+        ClearSkies();
         _autoWorld = world.Id;
         _min = null;
         _stateBox = null;
         _statePlate = null;
+        _nightPlate = null;
         _lobby = null;
         Save(WorldKey, world.Id);
         Save(MinKey, null);
         Save(StateKey, null);
         Save(PlateKey, null);
+        Save(NightKey, null);
     }
 
     string Describe()
@@ -309,7 +412,8 @@ public sealed class SimonSaysPlugin : IPlugin
         string start = _min is int min ? $"on, with {PlayerCount(min)}" : "off";
         string state = _stateBox is int box ? $"Toggle Box {box}" : "off";
         string plate = _statePlate is int pressed ? $"plate {pressed}" : "plate off";
-        return $"World {id}: auto start {start}, round state {state}, {plate}";
+        string night = _nightPlate is int sky ? $"night plate {sky}" : "night off";
+        return $"World {id}: auto start {start}, round state {state}, {plate}, {night}";
     }
 
     int? Stored(string key) => int.TryParse(_store.Get(key), NumberStyles.Integer, CultureInfo.InvariantCulture, out int value) ? value : null;
@@ -433,9 +537,9 @@ public sealed class SimonSaysPlugin : IPlugin
     {
         _playing.Clear();
         _playing.UnionWith(Remaining());
-        while (_next < Tasks.Length && Tasks[_next].Goal == Goal.Colossus && !ColossusFits())
+        while (_next < Tasks.Length && Skipped(Tasks[_next].Goal) is { } round)
         {
-            _world.Broadcast(Tint("Skipping the Colossus round", Sand));
+            _world.Broadcast(Tint($"Skipping the {round} round", Sand));
             _next++;
         }
         if (_next == Tasks.Length || _playing.Count == 0)
@@ -462,8 +566,37 @@ public sealed class SimonSaysPlugin : IPlugin
             foreach (IPlayer player in _playing.Where(player => EmptyHanded(player.Holding)).ToList())
                 Done(player);
         if (_goal == Goal.Water) FindWater(now);
+        if (_goal == Goal.Freeze)
+        {
+            _spots.Clear();
+            _freezeAt = now + FreezeDelay;
+        }
+        if (_goal == Goal.Seek) Choose(now);
+        if (_goal == Goal.Tnt)
+        {
+            _wavesLeft = TntWaves;
+            _nextWave = now;
+        }
         if (_goal == Goal.Colossus) Summon(now);
+        if (_goal == Goal.Drain)
+        {
+            _drainFrom = now + DrainDelay;
+            _nextDrain = _drainFrom;
+            _drainUntil = _drainFrom + DrainTime;
+        }
+        if (_goal == Goal.Leap) Lift(now);
     }
+
+    string? Skipped(Goal goal) => goal switch
+    {
+        Goal.Colossus when !ColossusFits() => "Colossus",
+        Goal.Underwater when WaterLevel() is null => "underwater",
+        Goal.Seek when _playing.Count < 2 => "hide and seek",
+        Goal.Leap when _world.Markers(SniperMarker).Count == 0 || _world.Markers(LandMarker).Count == 0 => "bounce pad",
+        _ => null,
+    };
+
+    float? WaterLevel() => _world.Objects.FirstOrDefault(obj => obj.Type == "WaterPlane")?.Position.Y;
 
     bool ColossusFits() => _playing.All(player => Version.TryParse(player.ClientVersion, out Version? version)
         && version >= FirstColossusClient && version < LastColossusClient);
@@ -493,10 +626,36 @@ public sealed class SimonSaysPlugin : IPlugin
         }
         if (now < _riseAt) return;
 
-        float level = _waterHome.Y + RiseHeight * Math.Min(1f, (now - _riseAt) / (float)Rise);
+        float level = Level(now);
         foreach (IPlayer player in Playing())
             if (player.Position is { } position && position.Y < level && _lost.Add(player))
                 Lose(player, "You touched the water!");
+    }
+
+    float Level(long now) => _waterHome.Y + RiseHeight * Math.Clamp((now - _riseAt) / (float)Rise, 0f, 1f);
+
+    void Soak()
+    {
+        if (WaterLevel() is not float level) return;
+        foreach (IPlayer player in Playing())
+            if (player.Position is { } position && position.Y + Chest.Y >= level && _lost.Add(player))
+                Lose(player, "You're not underwater!");
+    }
+
+    void Watch(long now)
+    {
+        if (_freezeAt > 0)
+        {
+            if (now < _freezeAt) return;
+            _freezeAt = 0;
+            foreach (IPlayer player in Playing())
+                if (player.Position is { } position) _spots[player] = position;
+            _world.Notify("Freeze!", brief: true);
+            return;
+        }
+        foreach ((IPlayer player, Vector3 spot) in _spots)
+            if (player.Position is { } position && Vector3.Distance(position, spot) > MoveTolerance && _lost.Add(player))
+                Lose(player, "You moved!");
     }
 
     void Drain(float seconds)
@@ -715,9 +874,173 @@ public sealed class SimonSaysPlugin : IPlugin
         if (Playing().All(_done.Contains)) EndRound(Environment.TickCount64);
     }
 
+    void Choose(long now)
+    {
+        IPlayer[] players = [.. Playing()];
+        _seeker = players[Random.Shared.Next(players.Length)];
+        _nextBoost = now;
+        _seeker.Equip(AvatarItem.Sword);
+        _seeker.Notify("You're the seeker, hit everyone!", brief: true);
+        _world.Broadcast($"{Bold(Tint(_seeker.Name, Bright))} {Tint("is the seeker!", Light)}");
+    }
+
+    void Chase(long now)
+    {
+        if (_seeker is null || now < _nextBoost) return;
+        _seeker.GiveLightningSpeed();
+        _nextBoost = now + BoostEvery;
+    }
+
+    void Hit(IPlayer victim, IPlayer attacker)
+    {
+        lock (_sync)
+        {
+            if (_goal != Goal.Seek || _seeker is null || attacker != _seeker || victim == _seeker || _pauseUntil > 0) return;
+            if (_playing.Contains(victim) && _lost.Add(victim)) Lose(victim, "The seeker got you!");
+        }
+    }
+
+    void Blast(long now)
+    {
+        if (_wavesLeft > 0 && now >= _nextWave) Plant(now);
+        if (_wireAt > 0 && now >= _wireAt)
+        {
+            _wireAt = 0;
+            foreach (int tnt in _tnts) _world.Link(_tntPlate, tnt);
+        }
+        if (_blastAt > 0 && now >= _blastAt)
+        {
+            _blastAt = 0;
+            _blastEnd = now + TntSettle;
+            _world.Press(_tntPlate);
+        }
+        if (_blastEnd == 0) return;
+        foreach (IPlayer player in Playing())
+            if (!player.Alive && _lost.Add(player) && Out(player, "Boom! You're out!"))
+                _respawning.Add(player);
+        if (now >= _blastEnd) ClearTnt();
+    }
+
+    bool Dark => _next >= 0 && _goal == Goal.Colossus && _pauseUntil == 0;
+
+    void Scatter()
+    {
+        foreach (IPlayer player in Playing())
+        {
+            if (player.Position is not { } spot) continue;
+            float angle = Random.Shared.NextSingle() * MathF.Tau;
+            Vector3 near = spot + new Vector3(MathF.Cos(angle) * MedkitSpread, 0.5f, MathF.Sin(angle) * MedkitSpread);
+            _medkits.Add(_world.Add("PickupItemSpawner", near, new Dictionary<string, object> { ["itemType"] = (int)AvatarItem.Health }).Id);
+        }
+    }
+
+    void Sap(long now)
+    {
+        if (_drainFrom > 0)
+        {
+            if (now < _drainFrom) return;
+            _drainFrom = 0;
+            Scatter();
+            _world.Notify("Your health is draining!", brief: true);
+        }
+        while (now >= _nextDrain && _nextDrain < _drainUntil)
+        {
+            _nextDrain += DrainEvery;
+            foreach (IPlayer player in Playing())
+                if (!_lost.Contains(player) && player.Alive) player.Damage(DrainTotal * DrainEvery / DrainTime);
+        }
+        foreach (IPlayer player in Playing())
+            if (!player.Alive && _lost.Add(player) && Out(player, "You ran out of health!"))
+                _respawning.Add(player);
+    }
+
+    void Lift(long now)
+    {
+        _aloft.Clear();
+        _landed.Clear();
+        _graceUntil = now + PortalGrace;
+        IReadOnlyList<IWorldObject> bases = _world.Markers(SniperMarker);
+        foreach (IPlayer player in Playing())
+        {
+            player.Equip(AvatarItem.Hand);
+            player.Teleport(bases[Random.Shared.Next(bases.Count)].Position, TeleportMethod.Teleporter);
+        }
+    }
+
+    bool Fall(long now)
+    {
+        if (_world.Markers(LandMarker) is not [var land, ..]) return false;
+        foreach (IPlayer player in Playing())
+        {
+            if (_done.Contains(player) || _lost.Contains(player)) continue;
+            if (now >= _graceUntil && _aloft.Contains(player) && !player.Alive)
+            {
+                _landed.Remove(player);
+                if (_lost.Add(player) && Out(player, "You died in the fall!")) _respawning.Add(player);
+                continue;
+            }
+            if (player.Position is not { } spot) continue;
+            if (spot.Y > land.Position.Y)
+            {
+                _aloft.Add(player);
+                _landed.Remove(player);
+            }
+            else if (_aloft.Contains(player) && player.Alive)
+            {
+                if (!_landed.TryGetValue(player, out long since)) _landed[player] = now;
+                else if (now - since >= LandHold && _done.Add(player)) player.Notify("Done!", brief: true);
+            }
+        }
+        if (!Playing().All(player => _done.Contains(player) || _lost.Contains(player))) return false;
+        EndRound(now);
+        return true;
+    }
+
+    void ClearMedkits()
+    {
+        foreach (int medkit in _medkits) _world.Remove(medkit);
+        _medkits.Clear();
+    }
+
+    void Plant(long now)
+    {
+        ClearTnt();
+        _wavesLeft--;
+        _nextWave = now + TntGap;
+        Vector3[] spots = [.. Playing().Where(player => !_lost.Contains(player) && player.Alive).Select(player => player.Position).OfType<Vector3>()];
+        if (spots.Length == 0) return;
+        _tntPlate = _world.Add("PressurePlate", spots[0] with { Y = spots.Min(spot => spot.Y) - TntDepth }, new Dictionary<string, object> { ["hide"] = true }).Id;
+        foreach (Vector3 spot in spots)
+        {
+            float angle = Random.Shared.NextSingle() * MathF.Tau;
+            _tnts.Add(_world.Add("Explosives", spot + new Vector3(MathF.Cos(angle) * TntSpread, 0.5f, MathF.Sin(angle) * TntSpread)).Id);
+        }
+        _wireAt = now + TntWire;
+        _blastAt = now + TntFuse;
+    }
+
+    void ClearTnt()
+    {
+        foreach (int tnt in _tnts) _world.Remove(tnt);
+        _tnts.Clear();
+        if (_tntPlate >= 0) _world.Remove(_tntPlate);
+        _tntPlate = -1;
+        _wireAt = _blastAt = _blastEnd = 0;
+    }
+
+    void Unseek()
+    {
+        _seeker?.Equip(AvatarItem.Hand);
+        _seeker = null;
+    }
+
     void EndRound(long now)
     {
         _world.Notify($"Round {_round} over", brief: true);
+        if (_goal == Goal.Underwater) Soak();
+        if (_goal == Goal.Seek) Unseek();
+        if (_goal == Goal.Tnt) ClearTnt();
+        if (_goal == Goal.Drain) ClearMedkits();
         Summary();
         Drain(EbbSeconds);
         Dismiss(now);
@@ -728,6 +1051,9 @@ public sealed class SimonSaysPlugin : IPlugin
     void Stop(long now)
     {
         _world.Broadcast($"{Title} {Tint("stopped", Ember)}");
+        Unseek();
+        ClearTnt();
+        ClearMedkits();
         Drain(EbbSeconds);
         Dismiss(now);
         foreach (IPlayer player in Remaining().ToList()) ToLobby(player);
@@ -745,7 +1071,7 @@ public sealed class SimonSaysPlugin : IPlugin
 
     void Summary()
     {
-        bool survival = _goal is Goal.Water or Goal.Colossus;
+        bool survival = _goal is Goal.Water or Goal.Underwater or Goal.Freeze or Goal.Seek or Goal.Tnt or Goal.Colossus or Goal.Drain;
         List<IPlayer> fallen = [.. Playing().Where(player => survival ? _lost.Contains(player) : !_done.Contains(player))];
         if (!survival)
             foreach (IPlayer player in fallen)
@@ -815,6 +1141,7 @@ public sealed class SimonSaysPlugin : IPlugin
             long now = Environment.TickCount64;
             Respawned();
             Bury(now);
+            Skies(now);
             if (_next < 0)
             {
                 Lobby(now);
@@ -839,6 +1166,11 @@ public sealed class SimonSaysPlugin : IPlugin
                 return;
             }
             if (_goal == Goal.Water) Flood(now);
+            if (_goal == Goal.Freeze) Watch(now);
+            if (_goal == Goal.Seek) Chase(now);
+            if (_goal == Goal.Tnt) Blast(now);
+            if (_goal == Goal.Drain) Sap(now);
+            if (_goal == Goal.Leap && Fall(now)) return;
             long left = _deadline - now;
             if (left <= 0)
             {
