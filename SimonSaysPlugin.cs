@@ -75,7 +75,7 @@ public sealed class SimonSaysPlugin : IPlugin
     static readonly int[] Heat = [0xFF7A45, 0xFFA04D, 0xFFC15E, 0xFFE08A];
     static readonly string Title = Bold(Tint("Simon Says", Gold));
 
-    enum Goal { Wave, Jump, DropWeapon, PickUp, Water, Underwater, Freeze, Seek, Tnt, Colossus, Drain, Leap }
+    enum Goal { Wave, Jump, DropWeapon, PickUp, Water, Underwater, Freeze, Seek, Tnt, Colossus, Drain, Leap, TakeSword, DontJump }
 
     static readonly (string Task, double Seconds, Goal Goal)[] Tasks =
     [
@@ -91,8 +91,10 @@ public sealed class SimonSaysPlugin : IPlugin
         ("kill the Colossus", 0, Goal.Colossus),
         ("pick up health packs", (DrainDelay + DrainTime + 1_000) / 1000.0, Goal.Drain),
         ("jump onto the bounce pad", 20, Goal.Leap),
+        ("take a sword", 15, Goal.TakeSword),
+        ("don't jump", 10, Goal.DontJump),
     ];
-    static readonly int[] Marks = [5000, 3000, 2000, 1000];
+    static readonly int[] Marks = [5000, 4000, 3000, 2000, 1000];
 
     sealed class Giant(INpc npc, IWorldObject? trigger, long readyAt)
     {
@@ -126,6 +128,7 @@ public sealed class SimonSaysPlugin : IPlugin
     readonly List<(INpc Npc, long RemoveAt)> _fallen = [];
     readonly Dictionary<IPlayer, Vector3> _spots = [];
     readonly Dictionary<IPlayer, (bool Night, long At)> _skies = [];
+    (string Task, double Seconds, Goal Goal)[] _shuffledTasks = [];
     IServer _server = null!;
     IPluginStorage _store = null!;
     IWorld _world = null!;
@@ -184,9 +187,23 @@ public sealed class SimonSaysPlugin : IPlugin
         server.PlayerJoined += Joined;
         server.PlayerLeft += Left;
         server.PlayerGestured += (player, gesture) => Check(player, Goal.Wave, gesture == Gesture.Wave);
-        server.PlayerAnimated += (player, animation) => Check(player, Goal.Jump, animation == AvatarAnimation.Jump);
-        server.PlayerSwitchedItem += (player, item) => Check(player, Goal.DropWeapon, EmptyHanded(item));
-        server.PlayerPickedUp += (player, _) => Check(player, Goal.PickUp, true);
+        server.PlayerAnimated += (player, animation) => {
+            Check(player, Goal.Jump, animation == AvatarAnimation.Jump);
+            if (animation == AvatarAnimation.Jump) {
+                lock (_sync) {
+                    if (_goal == Goal.DontJump && _playing.Contains(player) && _lost.Add(player)) {
+                        Lose(player, "You jumped!");
+                    }
+                }
+            }
+        };
+        server.PlayerSwitchedItem += (player, item) => {
+            Check(player, Goal.DropWeapon, EmptyHanded(item));
+            Check(player, Goal.TakeSword, item == AvatarItem.Sword);
+        };
+        server.PlayerPickedUp += (player, item) => {
+            Check(player, Goal.PickUp, true);
+        };
         server.PlayerKilledByNpc += KilledByNpc;
         server.PlayerHit += Hit;
     }
@@ -442,6 +459,14 @@ public sealed class SimonSaysPlugin : IPlugin
             SetState(world, false);
             return false;
         }
+
+        _shuffledTasks = [.. Tasks];
+        for (int i = _shuffledTasks.Length - 1; i > 0; i--)
+        {
+            int j = Random.Shared.Next(i + 1);
+            (_shuffledTasks[i], _shuffledTasks[j]) = (_shuffledTasks[j], _shuffledTasks[i]);
+        }
+
         _next = first;
         _round = first;
         _pauseUntil = Environment.TickCount64 + StartDelay;
@@ -537,12 +562,12 @@ public sealed class SimonSaysPlugin : IPlugin
     {
         _playing.Clear();
         _playing.UnionWith(Remaining());
-        while (_next < Tasks.Length && Skipped(Tasks[_next].Goal) is { } round)
+        while (_next < _shuffledTasks.Length && Skipped(_shuffledTasks[_next].Goal) is { } round)
         {
             _world.Broadcast(Tint($"Skipping the {round} round", Sand));
             _next++;
         }
-        if (_next == Tasks.Length || _playing.Count == 0)
+        if (_next == _shuffledTasks.Length || _playing.Count == 0)
         {
             _world.Broadcast(_playing.Count == 0
                 ? $"{Tint("Nobody won", Ember)} {Title}"
@@ -552,7 +577,7 @@ public sealed class SimonSaysPlugin : IPlugin
             return;
         }
 
-        (string task, double seconds, _goal) = Tasks[_next++];
+        (string task, double seconds, _goal) = _shuffledTasks[_next++];
         _round++;
         long now = Environment.TickCount64;
         _deadline = _goal == Goal.Colossus ? long.MaxValue : now + (long)(seconds * 1000);
@@ -564,6 +589,9 @@ public sealed class SimonSaysPlugin : IPlugin
 
         if (_goal == Goal.DropWeapon)
             foreach (IPlayer player in _playing.Where(player => EmptyHanded(player.Holding)).ToList())
+                Done(player);
+        if (_goal == Goal.TakeSword)
+            foreach (IPlayer player in _playing.Where(player => player.Holding == AvatarItem.Sword).ToList())
                 Done(player);
         if (_goal == Goal.Water) FindWater(now);
         if (_goal == Goal.Freeze)
@@ -1044,7 +1072,7 @@ public sealed class SimonSaysPlugin : IPlugin
         Summary();
         Drain(EbbSeconds);
         Dismiss(now);
-        if (_next < Tasks.Length) _pauseUntil = now + Pause;
+        if (_next < _shuffledTasks.Length) _pauseUntil = now + Pause;
         else Give();
     }
 
@@ -1071,7 +1099,7 @@ public sealed class SimonSaysPlugin : IPlugin
 
     void Summary()
     {
-        bool survival = _goal is Goal.Water or Goal.Underwater or Goal.Freeze or Goal.Seek or Goal.Tnt or Goal.Colossus or Goal.Drain;
+        bool survival = _goal is Goal.Water or Goal.Underwater or Goal.Freeze or Goal.Seek or Goal.Tnt or Goal.Colossus or Goal.Drain or Goal.DontJump;
         List<IPlayer> fallen = [.. Playing().Where(player => survival ? _lost.Contains(player) : !_done.Contains(player))];
         if (!survival)
             foreach (IPlayer player in fallen)
@@ -1171,6 +1199,9 @@ public sealed class SimonSaysPlugin : IPlugin
             if (_goal == Goal.Tnt) Blast(now);
             if (_goal == Goal.Drain) Sap(now);
             if (_goal == Goal.Leap && Fall(now)) return;
+            if (_goal == Goal.DontJump) {
+                // Игроки выживают, если удержались от прыжка до конца таймера
+            }
             long left = _deadline - now;
             if (left <= 0)
             {
