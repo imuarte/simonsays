@@ -10,7 +10,7 @@ public sealed class SimonSaysPlugin : IPlugin
     const int FinalCount = 3;
     const long Pause = 10_000;
     const long Rest = 5_000;
-    const long Calm = 5_000;
+    const long Calm = 8_000;
     const long Rise = 7_500;
     const long FreezeDelay = 6_000;
     const long Freeze = 7_000;
@@ -84,7 +84,7 @@ public sealed class SimonSaysPlugin : IPlugin
         ("drop your weapon", 10, Goal.DropWeapon),
         ("pick up a weapon", 10, Goal.PickUp),
         ("don't touch the water", (Calm + Rise) / 1000.0, Goal.Water),
-        ("go underwater", 30, Goal.Underwater),
+        ("go underwater", 15, Goal.Underwater),
         ("don't move", (FreezeDelay + Freeze) / 1000.0, Goal.Freeze),
         ("hide", 20, Goal.Seek),
         ("survive the TNT", (TntGap * (TntWaves - 1) + TntFuse + TntSettle) / 1000.0, Goal.Tnt),
@@ -156,6 +156,7 @@ public sealed class SimonSaysPlugin : IPlugin
     long _riseAt;
     bool _rising;
     long _freezeAt;
+    long _dontJumpActiveAt;
     IPlayer? _seeker;
     readonly List<int> _tnts = [];
     int _tntPlate = -1;
@@ -187,15 +188,17 @@ public sealed class SimonSaysPlugin : IPlugin
         server.PlayerJoined += Joined;
         server.PlayerLeft += Left;
         server.PlayerGestured += (player, gesture) => Check(player, Goal.Wave, gesture == Gesture.Wave);
-        server.PlayerAnimated += (player, animation) => {
-            Check(player, Goal.Jump, animation == AvatarAnimation.Jump);
-            if (animation == AvatarAnimation.Jump) {
-                lock (_sync) {
-                    if (_goal == Goal.DontJump && _playing.Contains(player) && _lost.Add(player)) {
-                        Lose(player, "You jumped!");
-                    }
+              server.PlayerAnimated += (player, animation) => 
+        {
+            // dude wtf im doing wrong
+            if (_next >= 0 && _goal == Goal.DontJump && Environment.TickCount64 < _deadline && animation == AvatarAnimation.Jump && _playing.Contains(player))
+            {
+                if (Environment.TickCount64 >= _dontJumpActiveAt)
+                {
+                    if (_lost.Add(player)) Lose(player, "You jumped after the countdown!");
                 }
             }
+            Check(player, Goal.Jump, animation == AvatarAnimation.Jump);
         };
         server.PlayerSwitchedItem += (player, item) => {
             Check(player, Goal.DropWeapon, EmptyHanded(item));
@@ -605,7 +608,17 @@ public sealed class SimonSaysPlugin : IPlugin
             _wavesLeft = TntWaves;
             _nextWave = now;
         }
-        if (_goal == Goal.Colossus) Summon(now);
+                if (_goal == Goal.Colossus)
+        {
+            float health = ColossusHealthPerPlayer * Math.Max(1, _playing.Count);
+            foreach ((Vector3 spot, IWorldObject? trigger) in Lairs())
+            {
+                INpc npc = _world.SpawnNpc("Colossus", spot, 0f);
+                npc.Speed = 0f;
+                npc.MaxHealth = health;
+                _giants.Add(new Giant(npc, trigger, now + ColossusWarmup));
+            }
+        }
         if (_goal == Goal.Drain)
         {
             _drainFrom = now + DrainDelay;
@@ -613,6 +626,10 @@ public sealed class SimonSaysPlugin : IPlugin
             _drainUntil = _drainFrom + DrainTime;
         }
         if (_goal == Goal.Leap) Lift(now);
+                if (_goal == Goal.DontJump)
+        {
+            _dontJumpActiveAt = now + 5_000; // Ловушка включится ровно через 5 секунд кулдауна
+        }
     }
 
     string? Skipped(Goal goal) => goal switch
@@ -688,22 +705,18 @@ public sealed class SimonSaysPlugin : IPlugin
 
     void Drain(float seconds)
     {
-        if (_water < 0) return;
-        if (_addedWater) _world.Remove(_water);
-        else _world.Move(_water, _waterHome, seconds: seconds);
-        _water = -1;
-    }
-
-    void Summon(long now)
+    if (_water < 0) return;
+    
+    if (_addedWater) 
     {
-        float health = ColossusHealthPerPlayer * Math.Max(1, _playing.Count);
-        foreach ((Vector3 spot, IWorldObject? trigger) in Lairs())
-        {
-            INpc npc = _world.SpawnNpc("Colossus", spot, 0f);
-            npc.Speed = 0f;
-            npc.MaxHealth = health;
-            _giants.Add(new Giant(npc, trigger, now + ColossusWarmup));
-        }
+        _world.Remove(_water); 
+    }
+    else 
+    {
+        _world.Move(_water, _waterHome, seconds: seconds);
+    }
+    
+    _water = -1;
     }
 
     IEnumerable<(Vector3 Spot, IWorldObject? Trigger)> Lairs()
@@ -1013,10 +1026,10 @@ public sealed class SimonSaysPlugin : IPlugin
                 _aloft.Add(player);
                 _landed.Remove(player);
             }
-            else if (_aloft.Contains(player) && player.Alive)
+                        else if (_aloft.Contains(player) && player.Alive)
             {
-                if (!_landed.TryGetValue(player, out long since)) _landed[player] = now;
-                else if (now - since >= LandHold && _done.Add(player)) player.Notify("Done!", brief: true);
+                // Без хардкода пж
+                if (_done.Add(player)) player.Notify("Done!", brief: true);
             }
         }
         if (!Playing().All(player => _done.Contains(player) || _lost.Contains(player))) return false;
@@ -1062,19 +1075,28 @@ public sealed class SimonSaysPlugin : IPlugin
         _seeker = null;
     }
 
-    void EndRound(long now)
-    {
-        _world.Notify($"Round {_round} over", brief: true);
-        if (_goal == Goal.Underwater) Soak();
-        if (_goal == Goal.Seek) Unseek();
-        if (_goal == Goal.Tnt) ClearTnt();
-        if (_goal == Goal.Drain) ClearMedkits();
-        Summary();
-        Drain(EbbSeconds);
-        Dismiss(now);
-        if (_next < _shuffledTasks.Length) _pauseUntil = now + Pause;
-        else Give();
-    }
+void EndRound(long now)
+{
+    _deadline = long.MaxValue; 
+
+    _world.Notify($"Round {_round} over", brief: true);
+    
+    if (_goal == Goal.Underwater) Soak();
+    if (_goal == Goal.Seek) Unseek();
+    if (_goal == Goal.Tnt) ClearTnt();
+    if (_goal == Goal.Drain) ClearMedkits();
+    
+    Summary();
+    
+    Drain(EbbSeconds); 
+    
+    Dismiss(now);
+    
+    if (_next < _shuffledTasks.Length) 
+        _pauseUntil = now + Pause;
+    else 
+        Give();
+}
 
     void Stop(long now)
     {
@@ -1200,7 +1222,7 @@ public sealed class SimonSaysPlugin : IPlugin
             if (_goal == Goal.Drain) Sap(now);
             if (_goal == Goal.Leap && Fall(now)) return;
             if (_goal == Goal.DontJump) {
-                // Игроки выживают, если удержались от прыжка до конца таймера
+                // temp
             }
             long left = _deadline - now;
             if (left <= 0)
